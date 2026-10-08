@@ -1,0 +1,120 @@
+#include "stm32f1xx_hal.h"
+#include "app_logic.h"
+
+static TIM_HandleTypeDef pwm_timer;
+static void fail(void)
+{
+    __disable_irq();
+    for (;;) { }
+}
+
+/* HSI 8 MHz / 2 * 16 = 64 MHz: no external crystal required. */
+static void clock_init(void)
+{
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
+    osc.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    osc.HSIState = RCC_HSI_ON;
+    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    osc.PLL.PLLState = RCC_PLL_ON;
+    osc.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2;
+    osc.PLL.PLLMUL = RCC_PLL_MUL16;
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK) fail();
+    clk.ClockType = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK |
+                    RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    clk.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV2;
+    clk.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2) != HAL_OK) fail();
+}
+
+static void gpio_init(void)
+{
+    __HAL_RCC_AFIO_CLK_ENABLE();
+    /* PB3/PB4 default to JTAG. Keep SWD on PA13/PA14, free LED pins. */
+    __HAL_AFIO_REMAP_SWJ_NOJTAG();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    GPIO_InitTypeDef gpio = {0};
+    HAL_GPIO_WritePin(GPIOB, 0x00FFU, GPIO_PIN_SET);
+    gpio.Pin = 0x00FFU;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &gpio);
+    gpio.Pin = GPIO_PIN_0;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOA, &gpio);
+    gpio.Pin = GPIO_PIN_6;
+    gpio.Mode = GPIO_MODE_AF_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA, &gpio);
+}
+
+static void pwm_init(void)
+{
+    __HAL_RCC_TIM3_CLK_ENABLE();
+    pwm_timer.Instance = TIM3;
+    /* APB1 = 32 MHz, TIM3 clock = 64 MHz. 64 MHz / 64 / 2000 = 500 Hz. */
+    pwm_timer.Init.Prescaler = 63U;
+    pwm_timer.Init.CounterMode = TIM_COUNTERMODE_UP;
+    pwm_timer.Init.Period = 1999U;
+    pwm_timer.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    pwm_timer.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_PWM_Init(&pwm_timer) != HAL_OK) fail();
+    TIM_OC_InitTypeDef channel = {0};
+    channel.OCMode = TIM_OCMODE_PWM1;
+    channel.Pulse = 0U;
+    channel.OCPolarity = TIM_OCPOLARITY_HIGH;
+    channel.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&pwm_timer, &channel, TIM_CHANNEL_1) != HAL_OK) fail();
+    if (HAL_TIM_PWM_Start(&pwm_timer, TIM_CHANNEL_1) != HAL_OK) fail();
+}
+
+void SysTick_Handler(void)
+{
+    HAL_IncTick();
+    HAL_SYSTICK_IRQHandler();
+}
+
+int main(void)
+{
+    HAL_Init();
+    clock_init();
+    gpio_init();
+    pwm_init();
+    App app;
+    app_init(&app, HAL_GetTick());
+    GPIO_PinState raw_previous = GPIO_PIN_SET;
+    GPIO_PinState stable = GPIO_PIN_SET;
+    uint32_t edge_time = HAL_GetTick();
+    uint8_t previous_leds = 0xFFU;
+    uint8_t previous_duty = 0U;
+
+    for (;;) {
+        uint32_t now = HAL_GetTick();
+        GPIO_PinState raw = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
+        if (raw != raw_previous) {
+            raw_previous = raw;
+            edge_time = now;
+        }
+        if ((uint32_t)(now - edge_time) >= DEBOUNCE_MS && stable != raw) {
+            stable = raw;
+            if (stable == GPIO_PIN_RESET) app_press(&app, now);
+        }
+        /* A freeze press takes priority over a step due in this same loop. */
+        app_tick(&app, now);
+        uint8_t leds = app_leds(&app);
+        if (leds != previous_leds) {
+            /* Atomic update; do not disturb PB8..PB15. High means LED on. */
+            GPIOB->BSRR = (uint32_t)leds | ((uint32_t)((~leds) & 0xFFU) << 16U);
+            previous_leds = leds;
+        }
+        if (app.duty != previous_duty) {
+            __HAL_TIM_SET_COMPARE(&pwm_timer, TIM_CHANNEL_1, app.duty * 20U);
+            previous_duty = app.duty;
+        }
+    }
+}
